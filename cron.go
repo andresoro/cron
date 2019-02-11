@@ -1,9 +1,9 @@
 package cron
 
 import (
+	"container/heap"
 	"log"
 	"runtime"
-	"sort"
 	"time"
 )
 
@@ -11,7 +11,7 @@ import (
 // specified by the schedule. It may be started, stopped, and the entries may
 // be inspected while running.
 type Cron struct {
-	entries  []*Entry
+	entries  EntryQueue
 	stop     chan struct{}
 	add      chan *Entry
 	snapshot chan []*Entry
@@ -49,23 +49,37 @@ type Entry struct {
 	Job Job
 }
 
-// byTime is a wrapper for sorting the entry array by time
-// (with zero time at the end).
-type byTime []*Entry
+// EntryQueue is a priority queue that implements heap.Interface
+type EntryQueue []*Entry
 
-func (s byTime) Len() int      { return len(s) }
-func (s byTime) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
-func (s byTime) Less(i, j int) bool {
+func (e EntryQueue) Len() int      { return len(e) }
+func (e EntryQueue) Swap(i, j int) { e[i], e[j] = e[j], e[i] }
+
+// Priority to entries with less time remaining
+func (e EntryQueue) Less(i, j int) bool {
 	// Two zero times should return false.
 	// Otherwise, zero is "greater" than any other time.
 	// (To sort it at the end of the list.)
-	if s[i].Next.IsZero() {
+	if e[i].Next.IsZero() {
 		return false
 	}
-	if s[j].Next.IsZero() {
+	if e[j].Next.IsZero() {
 		return true
 	}
-	return s[i].Next.Before(s[j].Next)
+	return e[i].Next.Before(e[j].Next)
+}
+
+// Push implements the heap.Interface
+func (e *EntryQueue) Push(x interface{}) {
+	*e = append(*e, x.(*Entry))
+}
+
+// Pop implements heap.Interface
+func (e *EntryQueue) Pop() interface{} {
+	n := len(*e)
+	x := (*e)[n-1]
+	*e = (*e)[0 : n-1]
+	return x
 }
 
 // New returns a new Cron job runner, in the Local time zone.
@@ -113,7 +127,7 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job) {
 		Job:      cmd,
 	}
 	if !c.running {
-		c.entries = append(c.entries, entry)
+		heap.Push(&c.entries, entry)
 		return
 	}
 
@@ -174,38 +188,40 @@ func (c *Cron) run() {
 		entry.Next = entry.Schedule.Next(now)
 	}
 
+	heap.Init(&c.entries)
+
 	for {
 		// Determine the next entry to run.
-		sort.Sort(byTime(c.entries))
 
 		var timer *time.Timer
+		var e *Entry
 		if len(c.entries) == 0 || c.entries[0].Next.IsZero() {
 			// If there are no entries yet, just sleep - it still handles new entries
 			// and stop requests.
 			timer = time.NewTimer(100000 * time.Hour)
 		} else {
-			timer = time.NewTimer(c.entries[0].Next.Sub(now))
+			// pop the entry with soonest time to run, use timer with its Next field
+			e = heap.Pop(&c.entries).(*Entry)
+			timer = time.NewTimer(e.Next.Sub(now))
+			// push the entry back into the queue with updated schedule
+			e.Prev = e.Next
+			e.Next = e.Schedule.Next(now)
+			heap.Push(&c.entries, e)
+
 		}
 
 		for {
 			select {
 			case now = <-timer.C:
 				now = now.In(c.location)
-				// Run every entry whose next time was less than now
-				for _, e := range c.entries {
-					if e.Next.After(now) || e.Next.IsZero() {
-						break
-					}
-					go c.runWithRecovery(e.Job)
-					e.Prev = e.Next
-					e.Next = e.Schedule.Next(now)
-				}
+				// Run every entry whose next time was less than n
+				go c.runWithRecovery(e.Job)
 
 			case newEntry := <-c.add:
 				timer.Stop()
 				now = c.now()
 				newEntry.Next = newEntry.Schedule.Next(now)
-				c.entries = append(c.entries, newEntry)
+				heap.Push(&c.entries, newEntry)
 
 			case <-c.snapshot:
 				c.snapshot <- c.entrySnapshot()
